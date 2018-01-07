@@ -182,11 +182,21 @@ class AUSTransaction(object):
        @type conn: sqlalchemy.engine.base.Connection
     """
 
-    def __init__(self, engine):
-        self.engine = engine
+    def __init__(self, table_or_engine, **table_data):
+        if type(table_or_engine) != Table:
+            self.engine = table_or_engine
+        else:
+            self.t = table_or_engine
+            self.engine = self.t.metadata.bind
         self.conn = self.engine.connect()
         self.trans = self.conn.begin()
         self.log = logging.getLogger(self.__class__.__name__)
+        self.callback_type = None
+        if table_data:
+            self.changed_by = table_data['changed_by']
+            self.query = table_data['query']
+            self.callback_type = table_data['callback_type']
+            self.callback = table_data['callback']
 
     def __enter__(self):
         return self
@@ -202,6 +212,8 @@ class AUSTransaction(object):
             # Also need to check for exceptions during commit!
             try:
                 self.commit()
+                if self.t:
+                    self.onCallback()
             except:
                 self.rollback()
                 raise
@@ -217,7 +229,8 @@ class AUSTransaction(object):
     def execute(self, statement):
         try:
             self.log.debug("Attempting to execute %s" % statement)
-            return self.conn.execute(statement)
+            self.ret = self.conn.execute(statement)
+            return self.ret
         except:
             self.log.debug("Caught exception")
             # We want to raise our own Exception, so that errors are easily
@@ -237,6 +250,13 @@ class AUSTransaction(object):
             self.rollback()
             e = TransactionError(e.args)
             raise TransactionError, e, tb
+
+    def onCallback(self):
+        if self.callback_type.lower() == "insert":
+            pk_columns = self.t.primary_key.columns.keys()
+            pk_values = self.ret.inserted_primary_key
+            pk_args = dict(zip(pk_columns, pk_values))
+        self.callback(self.t, self.callback_type, self.changed_by, self.query, self.trans, **pk_args)
 
     def rollback(self):
         self.trans.rollback()
@@ -315,6 +335,9 @@ class AUSTable(object):
     def getEngine(self):
         return self.t.metadata.bind
 
+    def getTable(self):
+        return self.t
+
     def _returnRowOrRaise(self, where, columns=None, transaction=None):
         """Return the row matching the where clause supplied. If no rows match or multiple rows match,
            a WrongNumberOfRowsError will be raised."""
@@ -372,7 +395,7 @@ class AUSTable(object):
         if transaction:
             result = transaction.execute(query).fetchall()
         else:
-            with AUSTransaction(self.getEngine()) as trans:
+            with AUSTransaction(self.getTable()) as trans:
                 result = trans.execute(query).fetchall()
 
         return rows_to_dicts(result)
@@ -387,7 +410,7 @@ class AUSTable(object):
         """
         return self.t.insert(values=columns)
 
-    def _prepareInsert(self, trans, changed_by, **columns):
+    def _prepareInsert(self, **columns):
         """Prepare an INSERT statement for commit. If this table has versioning enabled,
            data_version will be set to 1. If this table has history enabled, two rows
            will be created in that table: one representing the current state (NULL),
@@ -399,16 +422,17 @@ class AUSTable(object):
         if self.versioned:
             data['data_version'] = 1
         query = self._insertStatement(**data)
-        ret = trans.execute(query)
-        if self.history:
-            for q in self.history.forInsert(ret.inserted_primary_key, data, changed_by):
-                trans.execute(q)
-        if self.onInsert:
-            pk_columns = self.t.primary_key.columns.keys()
-            pk_values = ret.inserted_primary_key
-            pk_args = dict(zip(pk_columns, pk_values))
-            self.onInsert(self, "INSERT", changed_by, query, trans, **pk_args)
-        return ret
+        yield query, data
+        # ret = trans.execute(query)
+        # if self.history:
+        #     for q in self.history.forInsert(ret.inserted_primary_key, data, changed_by):
+        #         trans.execute(q)
+        # if self.onInsert:
+        #     pk_columns = self.t.primary_key.columns.keys()
+        #     pk_values = ret.inserted_primary_key
+        #     pk_args = dict(zip(pk_columns, pk_values))
+        #     self.onInsert(self, "INSERT", changed_by, query, trans, **pk_args)
+        # return ret
 
     def insert(self, changed_by=None, transaction=None, dryrun=False, **columns):
         """Perform an INSERT statement on this table. See AUSTable._insertStatement for
@@ -433,11 +457,27 @@ class AUSTable(object):
             self.log.debug("In dryrun mode, not doing anything...")
             return
 
+        query_data = self._prepareInsert(**columns)
+        query, data = next(query_data)
+        ret = None
         if transaction:
-            return self._prepareInsert(transaction, changed_by, **columns)
+            ret = transaction.execute(query)
+            if self.history:
+                for q in self.history.forInsert(ret.inserted_primary_key, data, changed_by):
+                    transaction.execute(q)
         else:
-            with AUSTransaction(self.getEngine()) as trans:
-                return self._prepareInsert(trans, changed_by, **columns)
+            table_args = {}
+            if self.onInsert:
+                table_args['changed_by'] = changed_by
+                table_args['callback_type'] = "INSERT"
+                table_args['callback'] = self.onInsert
+                table_args['query'] = query
+            with AUSTransaction(self.getTable(), **table_args) as trans:
+                ret = trans.execute(query)
+                if self.history:
+                    for q in self.history.forInsert(ret.inserted_primary_key, data, changed_by):
+                        trans.execute(q)
+        return ret
 
     def _deleteStatement(self, where):
         """Create a DELETE statement for this table.
@@ -529,7 +569,7 @@ class AUSTable(object):
         if transaction:
             return self._prepareDelete(transaction, where, changed_by, old_data_version)
         else:
-            with AUSTransaction(self.getEngine()) as trans:
+            with AUSTransaction(self.getTable()) as trans:
                 return self._prepareDelete(trans, where, changed_by, old_data_version)
 
     def _updateStatement(self, where, what):
@@ -633,7 +673,7 @@ class AUSTable(object):
         if transaction:
             return self._prepareUpdate(transaction, where, what, changed_by, old_data_version)
         else:
-            with AUSTransaction(self.getEngine()) as trans:
+            with AUSTransaction(self.getTable()) as trans:
                 return self._prepareUpdate(trans, where, what, changed_by, old_data_version)
 
     def getRecentChanges(self, limit=10, transaction=None):
